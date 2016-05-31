@@ -6,32 +6,31 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
 import android.graphics.BitmapFactory;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.IBinder;
+import android.preference.PreferenceManager;
 import android.support.annotation.Nullable;
 import android.support.v4.app.NotificationCompat;
 import android.widget.Toast;
 
 import com.njlabs.showjava.Constants;
 import com.njlabs.showjava.R;
-import com.njlabs.showjava.modals.HistoryItem;
 import com.njlabs.showjava.ui.AppProcessActivity;
 import com.njlabs.showjava.ui.JavaExplorer;
 import com.njlabs.showjava.utils.ExceptionHandler;
 import com.njlabs.showjava.utils.Notify;
 import com.njlabs.showjava.utils.SourceInfo;
+import com.njlabs.showjava.utils.Utils;
 import com.njlabs.showjava.utils.logging.Ln;
 
 import net.dongliu.apk.parser.ApkParser;
 
 import java.io.File;
-import java.util.List;
-
-import ollie.query.Select;
 
 @SuppressWarnings({"ConstantConditions", "ResultOfMethodCallIgnored"})
 public class ProcessService extends Service {
@@ -46,55 +45,84 @@ public class ProcessService extends Service {
 
     public Handler UIHandler;
 
-    public Notify processNotify;
+    private Notify processNotify;
     public ApkParser apkParser;
 
+    public String decompilerToUse = "cfr";
 
-
-    private class ToastRunnable implements Runnable {
-
-        String mText;
-        public ToastRunnable(String text) {
-            mText = text;
-        }
-        @Override
-        public void run(){
-            Toast.makeText(getApplicationContext(), mText, Toast.LENGTH_SHORT).show();
-        }
-    }
-
+    private int startID;
 
     public void onCreate() {
         super.onCreate();
     }
 
+    public int STACK_SIZE;
+    public boolean IGNORE_LIBS;
 
     public int onStartCommand(Intent intent, int flags, int startId) {
         super.onStartCommand(intent, flags, startId);
-        Ln.i("onStartCommand ProcessService");
 
+        this.startID = startId;
+        /**
+         * Initialize a handler for posting runnables that have to run on the UI thread
+         */
         UIHandler = new Handler();
 
+        /**
+         * Receive action from the intent and decide whether to start or stop the existing process
+         */
         if (intent.getAction().equals(Constants.ACTION.START_PROCESS)) {
-            Ln.i("Received Start Foreground Intent ");
+
+            /**
+             * The intent's actions is {@link Constants.ACTION.START_PROCESS}
+             * Which means, the process has to start.
+             *
+             * We build the notification and start the process as a foreground process (to prevent it
+             * from being killed on exit)
+             */
             startForeground(Constants.PROCESS_NOTIFICATION_ID, buildNotification());
             handleIntent(intent);
+
         } else if (intent.getAction().equals(Constants.ACTION.STOP_PROCESS)) {
-            Ln.i("Received Stop Foreground Intent");
-            stopForeground(true);
-            stopSelf();
+
+            /**
+             * The intent's actions is {@link Constants.ACTION.STOP_PROCESS}
+             * Which means, the process has to stop and kill itself.
+             *
+             * We are broadcasting an 'exit' status so that any activity listening can exit.
+             * We stop the foreground process.
+             * And we forcefully kill the service.
+             *
+             * Uses the {@link #killSelf()} method.
+             */
+
+            int toKillStartId = intent.getIntExtra("startId",-1);
+            killSelf(true, toKillStartId);
+
+        } else if(intent.getAction().equals(Constants.ACTION.STOP_PROCESS_FOR_NEW)) {
+            killSelf(false, -1);
         }
 
         return START_NOT_STICKY;
     }
 
-    protected void handleIntent(Intent workIntent) {
-        Ln.i("onHandleIntent ProcessService");
+    private void handleIntent(Intent workIntent) {
+
+        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(this);
+        STACK_SIZE = Integer.valueOf(prefs.getString("thread_stack_size", String.valueOf(20 * 1024 * 1024)));
+        IGNORE_LIBS = prefs.getBoolean("ignore_libraries", true);
+
+        /**
+         * This is the main starting point of the ProcessorService. The intent is read and handled here
+         */
         Bundle extras = workIntent.getExtras();
         if (extras != null) {
-            packageFilePath = extras.getString("package_file_path");
-            Ln.i("package_file_path :" + packageFilePath);
 
+            if(extras.containsKey("decompiler")){
+                decompilerToUse = extras.getString("decompiler");
+            }
+
+            packageFilePath = extras.getString("package_file_path");
             (new Thread(new Runnable() {
                 @Override
                 public void run() {
@@ -117,13 +145,14 @@ public class ProcessService extends Service {
                             resultIntent.putExtra("package_name", packageName);
                             resultIntent.putExtra("package_label", packageLabel);
                             resultIntent.putExtra("package_file_path", packageFilePath);
+                            resultIntent.putExtra("decompiler", decompilerToUse);
 
                             PendingIntent resultPendingIntent =
                                     PendingIntent.getActivity(ProcessService.this, 0, resultIntent, PendingIntent.FLAG_UPDATE_CURRENT);
                             processNotify.updateIntent(resultPendingIntent);
                         }
                     });
-                    sourceOutputDir = Environment.getExternalStorageDirectory()+"/ShowJava/sources/"+ packageName;
+                    sourceOutputDir = Environment.getExternalStorageDirectory() + "/ShowJava/sources/" + packageName;
                     javaSourceOutputDir = sourceOutputDir + "/java";
 
                     Ln.d(sourceOutputDir);
@@ -140,10 +169,12 @@ public class ProcessService extends Service {
                     });
                 }
             })).start();
+        } else {
+            killSelf(true, startID);
         }
     }
 
-    public void publishProgress(String progressText){
+    public void publishProgress(String progressText) {
         switch (progressText) {
             case "start_activity": {
                 decompileDone();
@@ -168,29 +199,11 @@ public class ProcessService extends Service {
         }
     }
 
-    private void decompileDone(){
+    private void decompileDone() {
         showCompletedNotification();
-        (new Thread(new Runnable() {
-            @Override
-            public void run() {
-
-                List<HistoryItem> old = Select.from(HistoryItem.class).where("package_id=?",packageName).fetch();
-
-                if(old.size() > 0) {
-                    for (HistoryItem cursor : old) {
-                        cursor.delete();
-                    }
-                }
-
-                HistoryItem decompileHistoryItem = new HistoryItem();
-                decompileHistoryItem.setPackageID(packageName);
-                decompileHistoryItem.setPackageLabel(packageLabel);
-                decompileHistoryItem.save();
-            }
-        })).start();
     }
 
-    private void showCompletedNotification(){
+    private void showCompletedNotification() {
 
         Intent resultIntent = new Intent(getApplicationContext(), JavaExplorer.class);
         resultIntent.putExtra("from_notification", true);
@@ -203,9 +216,9 @@ public class ProcessService extends Service {
         NotificationManager mNotifyManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
 
         NotificationCompat.Builder mBuilder = new NotificationCompat.Builder(this);
-        mBuilder.setContentTitle(packageLabel+" has been decompiled.")
+        mBuilder.setContentTitle(packageLabel + " has been decompiled.")
                 .setContentText("Tap to browse source")
-                .setSmallIcon(R.mipmap.ic_launcher)
+                .setSmallIcon(R.drawable.stat_action_done)
                 .setLargeIcon(BitmapFactory.decodeResource(getResources(), R.mipmap.ic_launcher))
                 .setContentIntent(resultPendingIntent)
                 .setPriority(NotificationCompat.PRIORITY_MAX)
@@ -215,20 +228,22 @@ public class ProcessService extends Service {
     }
 
     public void broadcastStatus(String status) {
-        sendNotification(status,"");
+        sendNotification(status, "");
         Intent localIntent = new Intent(Constants.PROCESS_BROADCAST_ACTION)
                 .putExtra(Constants.PROCESS_STATUS_KEY, status);
         sendBroadcast(localIntent);
     }
+
     public void broadcastStatus(String statusKey, String statusData) {
-        sendNotification(statusKey,statusData);
+        sendNotification(statusKey, statusData);
         Intent localIntent = new Intent(Constants.PROCESS_BROADCAST_ACTION)
-                                    .putExtra(Constants.PROCESS_STATUS_KEY, statusKey)
-                                    .putExtra(Constants.PROCESS_STATUS_MESSAGE, statusData);
+                .putExtra(Constants.PROCESS_STATUS_KEY, statusKey)
+                .putExtra(Constants.PROCESS_STATUS_MESSAGE, statusData);
         sendBroadcast(localIntent);
     }
+
     public void broadcastStatusWithPackageInfo(String statusKey, String dir, String packId) {
-        sendNotification(statusKey,"");
+        sendNotification(statusKey, "");
         Intent localIntent = new Intent(Constants.PROCESS_BROADCAST_ACTION)
                 .putExtra(Constants.PROCESS_STATUS_KEY, statusKey)
                 .putExtra(Constants.PROCESS_DIR, dir)
@@ -236,8 +251,8 @@ public class ProcessService extends Service {
         sendBroadcast(localIntent);
     }
 
-    private void sendNotification(String statusKey, String statusData){
-        switch(statusKey){
+    private void sendNotification(String statusKey, String statusData) {
+        switch (statusKey) {
             case "optimise_dex_start":
                 processNotify.updateTitleText("Optimising dex file", "Processing ...");
                 break;
@@ -268,11 +283,15 @@ public class ProcessService extends Service {
             case "jar2java":
                 processNotify.updateTitleText("Decompiling to java", "Processing ...");
                 break;
-            case "xml":
-                processNotify.updateTitleText("Extracting XML Resources", "Processing ...");
+            case "res":
+                processNotify.updateTitleText("Extracting Resources", "Processing ...");
                 break;
             case "exit":
-                processNotify.cancel();
+                try {
+                    processNotify.cancel();
+                } catch (Exception e) {
+                    Ln.i(e);
+                }
                 break;
 
             default:
@@ -280,10 +299,12 @@ public class ProcessService extends Service {
         }
     }
 
-    private Notification buildNotification(){
+    private Notification buildNotification() {
 
         Intent stopIntent = new Intent(this, ProcessService.class);
         stopIntent.setAction(Constants.ACTION.STOP_PROCESS);
+        stopIntent.putExtra("startID", startID);
+
         PendingIntent pendingStopIntent = PendingIntent.getService(this, 0, stopIntent, 0);
 
         NotificationManager mNotifyManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
@@ -291,7 +312,7 @@ public class ProcessService extends Service {
         NotificationCompat.Builder mBuilder = new NotificationCompat.Builder(this);
         mBuilder.setContentTitle("Decompiling")
                 .setContentText("Processing the apk")
-                .setSmallIcon(R.mipmap.ic_launcher)
+                .setSmallIcon(R.drawable.stat_action_running)
                 .setLargeIcon(BitmapFactory.decodeResource(getResources(), R.mipmap.ic_launcher))
                 .setOngoing(true)
                 .addAction(R.drawable.ic_action_kill, "Stop decompiler", pendingStopIntent)
@@ -303,7 +324,7 @@ public class ProcessService extends Service {
 
         mNotifyManager.notify(Constants.PROCESS_NOTIFICATION_ID, notification);
 
-        processNotify = new Notify(mNotifyManager,mBuilder,Constants.PROCESS_NOTIFICATION_ID);
+        processNotify = new Notify(mNotifyManager, mBuilder, Constants.PROCESS_NOTIFICATION_ID);
 
         return notification;
     }
@@ -312,9 +333,8 @@ public class ProcessService extends Service {
     public void onDestroy() {
         super.onDestroy();
         try {
-            kill();
             processNotify.cancel();
-        } catch (Exception e){
+        } catch (Exception e) {
             Ln.e(e);
         }
     }
@@ -325,8 +345,37 @@ public class ProcessService extends Service {
         return null;
     }
 
-    public void kill(){
+    private void kill() {
         stopForeground(true);
         stopSelf();
+    }
+
+    private class ToastRunnable implements Runnable {
+
+        final String mText;
+
+        public ToastRunnable(String text) {
+            mText = text;
+        }
+
+        @Override
+        public void run() {
+            Toast.makeText(getApplicationContext(), mText, Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void killSelf(boolean shouldBroadcast, int startID){
+        if(shouldBroadcast){
+            broadcastStatus("exit");
+        }
+        stopForeground(true);
+        stopSelf(startID);
+        try {
+            NotificationManager mNotifyManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+            mNotifyManager.cancel(Constants.PROCESS_NOTIFICATION_ID);
+            Utils.forceKillAllProcessorServices(this);
+        } catch (Exception e) {
+            Ln.e(e);
+        }
     }
 }

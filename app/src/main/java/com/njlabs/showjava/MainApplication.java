@@ -5,24 +5,20 @@ import android.content.Context;
 import android.support.multidex.MultiDex;
 
 import com.crashlytics.android.Crashlytics;
-import com.njlabs.showjava.utils.FontsOverride;
 
 import io.fabric.sdk.android.Fabric;
-import ollie.Ollie;
+import uk.co.chrisjenx.calligraphy.CalligraphyConfig;
 
 public class MainApplication extends Application {
-	
+
     public void onCreate() {
         super.onCreate();
         Fabric.with(this, new Crashlytics());
-        FontsOverride.with(this);
 
-        Ollie.with(this)
-                .setName("database.db")
-                .setVersion(1)
-                .setLogLevel(Ollie.LogLevel.FULL)
-                .setCacheSize(8 * 1024 * 1024)
-                .init();
+        CalligraphyConfig.initDefault(new CalligraphyConfig.Builder()
+                .setDefaultFontPath("fonts/lato-light.ttf")
+                .setFontAttrId(R.attr.fontPath)
+                .build());
     }
 
     @Override
